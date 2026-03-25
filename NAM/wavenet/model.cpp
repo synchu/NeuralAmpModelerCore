@@ -428,7 +428,7 @@ void nam::wavenet::detail::LayerArray::Process(const Eigen::MatrixXf& layer_inpu
                                                const int num_frames)
 {
   // Zero head inputs accumulator (first layer array)
-  this->_head_inputs.setZero();
+  this->_head_inputs.leftCols(num_frames).setZero();
   ProcessInner(layer_inputs, condition, num_frames);
 }
 
@@ -693,7 +693,7 @@ void nam::wavenet::WaveNet::_process_condition(const int num_frames)
 {
   if (this->_condition_dsp == nullptr)
   {
-    this->_condition_output.leftCols(num_frames) = this->_condition_input.leftCols(num_frames);
+    this->_condition_output.leftCols(num_frames).noalias() = this->_condition_input.leftCols(num_frames);
   }
   else
   {
