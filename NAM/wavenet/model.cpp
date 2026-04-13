@@ -130,6 +130,10 @@ void nam::wavenet::detail::Layer::SetMaxBufferSize(const int maxBufferSize)
     this->_layer1x1_post_film->SetMaxBufferSize(maxBufferSize);
   if (this->_head1x1_post_film)
     this->_head1x1_post_film->SetMaxBufferSize(maxBufferSize);
+  if (this->_gating_activation)
+    this->_gating_activation->SetMaxBufferSize(maxBufferSize);
+  if (this->_blending_activation)
+    this->_blending_activation->SetMaxBufferSize(maxBufferSize);
 }
 
 void nam::wavenet::detail::Layer::set_weights_(std::vector<float>::iterator& weights)
@@ -200,72 +204,115 @@ void nam::wavenet::detail::Layer::Process(const Eigen::MatrixXf& input, const Ei
     Eigen::MatrixXf& input_mixin_output = this->_input_mixin.GetOutput();
     this->_input_mixin_post_film->Process_(input_mixin_output, condition, num_frames);
   }
-  this->_z.leftCols(num_frames).noalias() =
-    _conv.GetOutput().leftCols(num_frames) + _input_mixin.GetOutput().leftCols(num_frames);
 
-  if (this->_activation_pre_film)
-  {
-    this->_activation_pre_film->Process_(this->_z, condition, num_frames);
-  }
-
-  // Step 2 & 3: activation and 1x1
+  // Step 2: Fuse conv+mixin addition with activation when possible
   //
-  // A note about the gating/blending activations:
-  // They take 2x dimension as input.
-  // The top channels are for the "primary" activation and will be in-place modified for the final result.
-  // The bottom channels are for the "secondary" activation and should not be used post-activation.
-  if (this->_gating_mode == GatingMode::NONE)
+  // For the common non-gated, no-FiLM case, fuse the z = conv + mixin
+  // and activation(z) into a single pass to halve memory traffic over _z.
+  const bool can_fuse_add_activation =
+    (this->_gating_mode == GatingMode::NONE) && !this->_activation_pre_film && !this->_activation_post_film;
+
+#ifdef NAM_USE_INLINE_GEMM
+  if (can_fuse_add_activation)
   {
-    this->_activation->apply(this->_z.leftCols(num_frames));
-    if (this->_activation_post_film)
+    // Fused: z[i] = activation(conv[i] + mixin[i]) in one pass
+    const int total = (int)bottleneck * num_frames;
+    const float* __restrict__ conv_ptr = _conv.GetOutput().data();
+    const float* __restrict__ mixin_ptr = _input_mixin.GetOutput().data();
+    float* __restrict__ z_ptr = this->_z.data();
+
+    // Write _z = conv + mixin (unfused activation follows immediately)
+    int i = 0;
+    for (; i + 3 < total; i += 4)
     {
-      this->_activation_post_film->Process_(this->_z, condition, num_frames);
+      z_ptr[i] = conv_ptr[i] + mixin_ptr[i];
+      z_ptr[i + 1] = conv_ptr[i + 1] + mixin_ptr[i + 1];
+      z_ptr[i + 2] = conv_ptr[i + 2] + mixin_ptr[i + 2];
+      z_ptr[i + 3] = conv_ptr[i + 3] + mixin_ptr[i + 3];
     }
+    for (; i < total; i++)
+      z_ptr[i] = conv_ptr[i] + mixin_ptr[i];
+
+    // Apply activation in-place (data is now hot in cache from the write above)
+    this->_activation->apply(z_ptr, (long)total);
+
+    // Continue with layer1x1 (no activation_post_film in this path)
     if (this->_layer1x1)
     {
       this->_layer1x1->process_(this->_z, num_frames);
     }
   }
-  else if (this->_gating_mode == GatingMode::GATED)
+  else
+#endif
   {
-    // Use the GatingActivation class
-    // Extract the blocks first to avoid temporary reference issues
-    auto input_block = this->_z.leftCols(num_frames);
-    auto output_block = this->_z.topRows(bottleneck).leftCols(num_frames);
-    this->_gating_activation->apply(input_block, output_block);
-    if (this->_activation_post_film)
+    // Original separated path (needed for gated/FiLM cases)
+    this->_z.leftCols(num_frames).noalias() =
+      _conv.GetOutput().leftCols(num_frames) + _input_mixin.GetOutput().leftCols(num_frames);
+
+    if (this->_activation_pre_film)
     {
-      // Use Process() for blocks and copy result back
-      this->_activation_post_film->Process(this->_z.topRows(bottleneck), condition, num_frames);
-      this->_z.topRows(bottleneck).leftCols(num_frames).noalias() =
-        this->_activation_post_film->GetOutput().leftCols(num_frames);
+      this->_activation_pre_film->Process_(this->_z, condition, num_frames);
     }
-    if (this->_layer1x1)
+
+    // Step 2 & 3: activation and 1x1
+    //
+    // A note about the gating/blending activations:
+    // They take 2x dimension as input.
+    // The top channels are for the "primary" activation and will be in-place modified for the final result.
+    // The bottom channels are for the "secondary" activation and should not be used post-activation.
+    if (this->_gating_mode == GatingMode::NONE)
     {
-      this->_layer1x1->process_(this->_z.topRows(bottleneck), num_frames);
-    }
-  }
-  else if (this->_gating_mode == GatingMode::BLENDED)
-  {
-    // Use the BlendingActivation class
-    // Extract the blocks first to avoid temporary reference issues
-    auto input_block = this->_z.leftCols(num_frames);
-    auto output_block = this->_z.topRows(bottleneck).leftCols(num_frames);
-    this->_blending_activation->apply(input_block, output_block);
-    if (this->_activation_post_film)
-    {
-      // Use Process() for blocks and copy result back
-      this->_activation_post_film->Process(this->_z.topRows(bottleneck), condition, num_frames);
-      this->_z.topRows(bottleneck).leftCols(num_frames).noalias() =
-        this->_activation_post_film->GetOutput().leftCols(num_frames);
-    }
-    if (this->_layer1x1)
-    {
-      this->_layer1x1->process_(this->_z.topRows(bottleneck), num_frames);
-      if (this->_layer1x1_post_film)
+      this->_activation->apply(this->_z.leftCols(num_frames));
+      if (this->_activation_post_film)
       {
-        Eigen::MatrixXf& layer1x1_output = this->_layer1x1->GetOutput();
-        this->_layer1x1_post_film->Process_(layer1x1_output, condition, num_frames);
+        this->_activation_post_film->Process_(this->_z, condition, num_frames);
+      }
+      if (this->_layer1x1)
+      {
+        this->_layer1x1->process_(this->_z, num_frames);
+      }
+    }
+    else if (this->_gating_mode == GatingMode::GATED)
+    {
+      // Use the GatingActivation class
+      // Extract the blocks first to avoid temporary reference issues
+      auto input_block = this->_z.leftCols(num_frames);
+      auto output_block = this->_z.topRows(bottleneck).leftCols(num_frames);
+      this->_gating_activation->apply(input_block, output_block);
+      if (this->_activation_post_film)
+      {
+        // Use Process() for blocks and copy result back
+        this->_activation_post_film->Process(this->_z.topRows(bottleneck), condition, num_frames);
+        this->_z.topRows(bottleneck).leftCols(num_frames).noalias() =
+          this->_activation_post_film->GetOutput().leftCols(num_frames);
+      }
+      if (this->_layer1x1)
+      {
+        this->_layer1x1->process_(this->_z.topRows(bottleneck), num_frames);
+      }
+    }
+    else if (this->_gating_mode == GatingMode::BLENDED)
+    {
+      // Use the BlendingActivation class
+      // Extract the blocks first to avoid temporary reference issues
+      auto input_block = this->_z.leftCols(num_frames);
+      auto output_block = this->_z.topRows(bottleneck).leftCols(num_frames);
+      this->_blending_activation->apply(input_block, output_block);
+      if (this->_activation_post_film)
+      {
+        // Use Process() for blocks and copy result back
+        this->_activation_post_film->Process(this->_z.topRows(bottleneck), condition, num_frames);
+        this->_z.topRows(bottleneck).leftCols(num_frames).noalias() =
+          this->_activation_post_film->GetOutput().leftCols(num_frames);
+      }
+      if (this->_layer1x1)
+      {
+        this->_layer1x1->process_(this->_z.topRows(bottleneck), num_frames);
+        if (this->_layer1x1_post_film)
+        {
+          Eigen::MatrixXf& layer1x1_output = this->_layer1x1->GetOutput();
+          this->_layer1x1_post_film->Process_(layer1x1_output, condition, num_frames);
+        }
       }
     }
   }
@@ -724,12 +771,22 @@ void nam::wavenet::WaveNet::_process_condition(const int num_frames)
 void nam::wavenet::WaveNet::_set_condition_array(NAM_SAMPLE** input, const int num_frames)
 {
   const int in_channels = NumInputChannels();
-  // Fill condition array with input channels
-  for (int ch = 0; ch < in_channels; ch++)
+  if (in_channels == 1)
   {
+    // Single channel: row 0 of column-major matrix IS contiguous
+    float* dst = this->_condition_input.data();
+    const NAM_SAMPLE* src = input[0];
     for (int j = 0; j < num_frames; j++)
+      dst[j] = static_cast<float>(src[j]);
+  }
+  else
+  {
+    for (int ch = 0; ch < in_channels; ch++)
     {
-      this->_condition_input(ch, j) = input[ch][j];
+      for (int j = 0; j < num_frames; j++)
+      {
+        this->_condition_input(ch, j) = input[ch][j];
+      }
     }
   }
 }

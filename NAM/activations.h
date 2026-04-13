@@ -15,6 +15,12 @@
 
 #include "json.hpp"
 
+// SIMD detection for activation vectorization (SSE2 is baseline for x64)
+#if defined(_M_X64) || defined(_M_AMD64) || defined(__x86_64__) || defined(__SSE2__)
+#define NAM_SIMD_SSE2 1
+#include <immintrin.h>
+#endif
+
 namespace nam
 {
 namespace activations
@@ -132,6 +138,103 @@ inline float softsign(float x)
   return x / (1.0f + fabsf(x));
 }
 
+// ==========================================================================
+// SSE2 SIMD helper functions — process 4 floats at a time.
+// Numerically identical to scalar helpers (no approximation changes).
+// ==========================================================================
+
+#ifdef NAM_SIMD_SSE2
+namespace simd
+{
+
+// Absolute value: clear sign bit
+inline __m128 abs_ps(__m128 x)
+{
+  return _mm_andnot_ps(_mm_set1_ps(-0.0f), x);
+}
+
+// ReLU: max(x, 0)
+inline __m128 relu_ps(__m128 x)
+{
+  return _mm_max_ps(x, _mm_setzero_ps());
+}
+
+// HardTanh: clamp(x, -1, 1)
+inline __m128 hard_tanh_ps(__m128 x)
+{
+  return _mm_max_ps(_mm_min_ps(x, _mm_set1_ps(1.0f)), _mm_set1_ps(-1.0f));
+}
+
+// FastTanh: vectorized rational polynomial (same coefficients as scalar fast_tanh)
+inline __m128 fast_tanh_ps(__m128 x)
+{
+  const __m128 ax = abs_ps(x);
+  const __m128 x2 = _mm_mul_ps(x, x);
+
+  const __m128 c1 = _mm_set1_ps(2.45550750702956f);
+  const __m128 c2 = _mm_set1_ps(0.893229853513558f);
+  const __m128 c3 = _mm_set1_ps(0.821226666969744f);
+  const __m128 c4 = _mm_set1_ps(2.44506634652299f);
+  const __m128 c5 = _mm_set1_ps(0.814642734961073f);
+
+  // numerator = x * (c1 + c1*ax + (c2 + c3*ax) * x2)
+  __m128 inner = _mm_add_ps(c2, _mm_mul_ps(c3, ax));
+  inner = _mm_mul_ps(inner, x2);
+  __m128 num = _mm_add_ps(c1, _mm_add_ps(_mm_mul_ps(c1, ax), inner));
+  num = _mm_mul_ps(x, num);
+
+  // denominator = c4 + (c4 + x2) * |x + c5 * x * ax|
+  __m128 x_ax = _mm_mul_ps(x, ax);
+  __m128 denom_inner = _mm_add_ps(x, _mm_mul_ps(c5, x_ax));
+  denom_inner = abs_ps(denom_inner);
+  __m128 denom = _mm_add_ps(c4, _mm_mul_ps(_mm_add_ps(c4, x2), denom_inner));
+
+  return _mm_div_ps(num, denom);
+}
+
+// LeakyReLU: x > 0 ? x : slope * x
+inline __m128 leaky_relu_ps(__m128 x, __m128 slope)
+{
+  __m128 mask = _mm_cmpgt_ps(x, _mm_setzero_ps());
+  __m128 neg = _mm_mul_ps(slope, x);
+  return _mm_or_ps(_mm_and_ps(mask, x), _mm_andnot_ps(mask, neg));
+}
+
+// HardSwish: x * clamp(x+3, 0, 6) / 6
+inline __m128 hardswish_ps(__m128 x)
+{
+  const __m128 three = _mm_set1_ps(3.0f);
+  const __m128 six = _mm_set1_ps(6.0f);
+  const __m128 inv6 = _mm_set1_ps(1.0f / 6.0f);
+  __m128 t = _mm_add_ps(x, three);
+  t = _mm_max_ps(_mm_min_ps(t, six), _mm_setzero_ps());
+  return _mm_mul_ps(_mm_mul_ps(x, t), inv6);
+}
+
+// Softsign: x / (1 + |x|)
+inline __m128 softsign_ps(__m128 x)
+{
+  return _mm_div_ps(x, _mm_add_ps(_mm_set1_ps(1.0f), abs_ps(x)));
+}
+
+// LeakyHardTanh: piecewise linear with slopes outside [min_val, max_val]
+inline __m128 leaky_hardtanh_ps(__m128 x, __m128 vmin, __m128 vmax, __m128 min_slope, __m128 max_slope)
+{
+  __m128 mask_lo = _mm_cmplt_ps(x, vmin);
+  __m128 mask_hi = _mm_cmpgt_ps(x, vmax);
+
+  __m128 lo_result = _mm_add_ps(_mm_mul_ps(_mm_sub_ps(x, vmin), min_slope), vmin);
+  __m128 hi_result = _mm_add_ps(_mm_mul_ps(_mm_sub_ps(x, vmax), max_slope), vmax);
+
+  // Start with x (mid case), blend in lo/hi results where masks are active
+  __m128 result = _mm_or_ps(_mm_andnot_ps(mask_lo, x), _mm_and_ps(mask_lo, lo_result));
+  result = _mm_or_ps(_mm_andnot_ps(mask_hi, result), _mm_and_ps(mask_hi, hi_result));
+  return result;
+}
+
+} // namespace simd
+#endif // NAM_SIMD_SSE2
+
 class Activation
 {
 public:
@@ -179,6 +282,8 @@ public:
   virtual void apply(float* data, long size) override {};
 };
 
+// Tanh — uses std::tanh (transcendental); left scalar.
+// Users wanting speed should use ActivationFastTanh which has a SIMD path.
 class ActivationTanh : public Activation
 {
 public:
@@ -196,10 +301,21 @@ class ActivationHardTanh : public Activation
 public:
   void apply(float* data, long size) override
   {
+#ifdef NAM_SIMD_SSE2
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      __m128 v = _mm_loadu_ps(data + pos);
+      _mm_storeu_ps(data + pos, simd::hard_tanh_ps(v));
+    }
+    for (; pos < size; pos++)
+      data[pos] = hard_tanh(data[pos]);
+#else
     for (long pos = 0; pos < size; pos++)
     {
       data[pos] = hard_tanh(data[pos]);
     }
+#endif
   }
 };
 
@@ -216,10 +332,25 @@ public:
   }
   void apply(float* data, long size) override
   {
+#ifdef NAM_SIMD_SSE2
+    const __m128 vmin = _mm_set1_ps(min_val);
+    const __m128 vmax = _mm_set1_ps(max_val);
+    const __m128 vmin_slope = _mm_set1_ps(min_slope);
+    const __m128 vmax_slope = _mm_set1_ps(max_slope);
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      __m128 v = _mm_loadu_ps(data + pos);
+      _mm_storeu_ps(data + pos, simd::leaky_hardtanh_ps(v, vmin, vmax, vmin_slope, vmax_slope));
+    }
+    for (; pos < size; pos++)
+      data[pos] = leaky_hardtanh(data[pos], min_val, max_val, min_slope, max_slope);
+#else
     for (long pos = 0; pos < size; pos++)
     {
       data[pos] = leaky_hardtanh(data[pos], min_val, max_val, min_slope, max_slope);
     }
+#endif
   }
 
 private:
@@ -234,10 +365,21 @@ class ActivationFastTanh : public Activation
 public:
   void apply(float* data, long size) override
   {
+#ifdef NAM_SIMD_SSE2
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      __m128 v = _mm_loadu_ps(data + pos);
+      _mm_storeu_ps(data + pos, simd::fast_tanh_ps(v));
+    }
+    for (; pos < size; pos++)
+      data[pos] = fast_tanh(data[pos]);
+#else
     for (long pos = 0; pos < size; pos++)
     {
       data[pos] = fast_tanh(data[pos]);
     }
+#endif
   }
 };
 
@@ -246,8 +388,19 @@ class ActivationReLU : public Activation
 public:
   void apply(float* data, long size) override
   {
+#ifdef NAM_SIMD_SSE2
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      __m128 v = _mm_loadu_ps(data + pos);
+      _mm_storeu_ps(data + pos, simd::relu_ps(v));
+    }
+    for (; pos < size; pos++)
+      data[pos] = relu(data[pos]);
+#else
     for (long pos = 0; pos < size; pos++)
       data[pos] = relu(data[pos]);
+#endif
   }
 };
 
@@ -258,16 +411,30 @@ public:
   ActivationLeakyReLU(float ns) { negative_slope = ns; }
   void apply(float* data, long size) override
   {
+#ifdef NAM_SIMD_SSE2
+    const __m128 slope = _mm_set1_ps(negative_slope);
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      __m128 v = _mm_loadu_ps(data + pos);
+      _mm_storeu_ps(data + pos, simd::leaky_relu_ps(v, slope));
+    }
+    for (; pos < size; pos++)
+      data[pos] = leaky_relu(data[pos], negative_slope);
+#else
     for (long pos = 0; pos < size; pos++)
     {
       data[pos] = leaky_relu(data[pos], negative_slope);
     }
+#endif
   }
 
 private:
   float negative_slope = 0.01;
 };
 
+// PReLU — per-channel slopes with small channel counts (2-8) don't pack well
+// into SIMD lanes. The stride-based loop already eliminates the modulo overhead.
 class ActivationPReLU : public Activation
 {
 public:
@@ -281,19 +448,17 @@ public:
 
   void apply(float* data, long size) override
   {
-    // Assume column-major (this is brittle)
-#ifndef NDEBUG
-    if (size % negative_slopes.size() != 0)
+    // Avoid modulo in hot loop: stride over channels explicitly
+    const long num_ch = (long)negative_slopes.size();
+    const long num_frames = size / num_ch;
+    const float* slopes = negative_slopes.data();
+    for (long f = 0; f < num_frames; f++)
     {
-      throw std::invalid_argument("PReLU.apply(*data, size) was given an array of size " + std::to_string(size)
-                                  + " but the activation has " + std::to_string(negative_slopes.size())
-                                  + " channels, which doesn't divide evenly.");
-    }
-#endif
-    for (long pos = 0; pos < size; pos++)
-    {
-      const float negative_slope = negative_slopes[pos % negative_slopes.size()];
-      data[pos] = leaky_relu(data[pos], negative_slope);
+      float* col = data + f * num_ch;
+      for (long c = 0; c < num_ch; c++)
+      {
+        col[c] = leaky_relu(col[c], slopes[c]);
+      }
     }
   }
 
@@ -302,10 +467,6 @@ public:
     // Matrix is organized as (channels, time_steps)
     unsigned long actual_channels = static_cast<unsigned long>(matrix.rows());
 
-    // Prepare the slopes for the current matrix size
-    std::vector<float> slopes_for_channels = negative_slopes;
-
-    // Fail loudly if input has more channels than activation
 #ifndef NDEBUG
     if (actual_channels != negative_slopes.size())
     {
@@ -321,7 +482,7 @@ public:
       // Apply the negative slope to all time steps in this channel
       for (int time_step = 0; time_step < matrix.cols(); time_step++)
       {
-        matrix(channel, time_step) = leaky_relu(matrix(channel, time_step), slopes_for_channels[channel]);
+        matrix(channel, time_step) = leaky_relu(matrix(channel, time_step), negative_slopes[channel]);
       }
     }
   }
@@ -331,6 +492,7 @@ private:
 };
 
 
+// Sigmoid — uses transcendental expf; left scalar.
 class ActivationSigmoid : public Activation
 {
 public:
@@ -341,6 +503,7 @@ public:
   }
 };
 
+// Swish (SiLU) — depends on expf via sigmoid; left scalar.
 class ActivationSwish : public Activation
 {
 public:
@@ -356,8 +519,19 @@ class ActivationHardSwish : public Activation
 public:
   void apply(float* data, long size) override
   {
+#ifdef NAM_SIMD_SSE2
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      __m128 v = _mm_loadu_ps(data + pos);
+      _mm_storeu_ps(data + pos, simd::hardswish_ps(v));
+    }
+    for (; pos < size; pos++)
+      data[pos] = hardswish(data[pos]);
+#else
     for (long pos = 0; pos < size; pos++)
       data[pos] = hardswish(data[pos]);
+#endif
   }
 };
 
@@ -366,11 +540,23 @@ class ActivationSoftsign : public Activation
 public:
   void apply(float* data, long size) override
   {
+#ifdef NAM_SIMD_SSE2
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      __m128 v = _mm_loadu_ps(data + pos);
+      _mm_storeu_ps(data + pos, simd::softsign_ps(v));
+    }
+    for (; pos < size; pos++)
+      data[pos] = softsign(data[pos]);
+#else
     for (long pos = 0; pos < size; pos++)
       data[pos] = softsign(data[pos]);
+#endif
   }
 };
 
+// FastLUTActivation — table lookup is inherently scalar (no gather until AVX2)
 class FastLUTActivation : public Activation
 {
 public:
