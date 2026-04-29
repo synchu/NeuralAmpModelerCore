@@ -291,7 +291,7 @@ bool is_full_size(const std::vector<wavenet::LayerArrayParams>& params, const st
 
 } // anonymous namespace
 
-#ifdef _LIBCPP_VERSION
+#if defined(_LIBCPP_VERSION) || defined(__clang__)
 void SlimmableWavenet::_pending_clear_release()
 {
   std::atomic_store_explicit(&_pending_staged, std::shared_ptr<StagedSlimModel>{}, std::memory_order_release);
