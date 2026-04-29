@@ -3,8 +3,9 @@
 #include <memory>
 #include <vector>
 
-#ifdef _LIBCPP_VERSION
-// libc++: std::atomic<std::shared_ptr<T>> is not viable; staging uses deprecated atomic_* free functions.
+#if defined(_LIBCPP_VERSION) || defined(__clang__)
+// libc++ and clang-cl (MSVC STL): std::atomic<std::shared_ptr<T>> is not reliably
+// available. Use deprecated std::atomic_* free functions instead.
 #else
   #include <atomic>
 #endif
@@ -27,8 +28,8 @@ namespace slimmable_wavenet
 /// maps the ratio to a channel count per array, extracts a weight subset, builds
 /// modified LayerArrayParams, and constructs a replacement WaveNet published to a staging
 /// slot (release). process() takes the slot (acquire/release) and installs the new WaveNet
-/// before DSP. libc++ uses std::atomic_* free functions on shared_ptr; other STLs use
-/// std::atomic<std::shared_ptr<…>>.
+/// before DSP. libc++ and clang-cl use std::atomic_* free functions on shared_ptr;
+/// other STLs (GCC/libstdc++, MSVC with MSVC compiler) use std::atomic<std::shared_ptr<…>>.
 class SlimmableWavenet : public DSP, public SlimmableModel
 {
 public:
@@ -70,8 +71,9 @@ private:
     std::shared_ptr<DSP> model;
     std::vector<int> channels;
   };
-#ifdef _LIBCPP_VERSION
-  /// Staged model; synchronized via deprecated std::atomic_* overloads for shared_ptr only.
+#if defined(_LIBCPP_VERSION) || defined(__clang__)
+  /// Staged model; synchronized via deprecated std::atomic_* overloads for shared_ptr.
+  /// Used for libc++ and clang-cl (MSVC STL), where atomic<shared_ptr<T>> is not reliable.
   std::shared_ptr<StagedSlimModel> _pending_staged;
 #else
   std::atomic<std::shared_ptr<StagedSlimModel>> _pending_staged;
