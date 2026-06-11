@@ -52,7 +52,7 @@ public:
   void SetSlimmableSize(const double val) override;
 
 protected:
-  int PrewarmSamples() override { return 0; }
+  int GetPrewarmSamples() override { return 0; }
 
 private:
   std::vector<wavenet::LayerArrayParams> _original_params;
