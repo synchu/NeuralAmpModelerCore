@@ -9,7 +9,7 @@
 // overloads for shared_ptr, which provide the same acquire/release semantics. Keyed on the
 // C++20 feature-test macro rather than on a specific standard library so the right path is
 // chosen for every compiler.
-#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L || defined(__clang__)
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L 
   #define NAM_HAS_ATOMIC_SHARED_PTR 1
 #else
   #define NAM_HAS_ATOMIC_SHARED_PTR 0
