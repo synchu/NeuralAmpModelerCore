@@ -165,6 +165,14 @@ public:
   /// \param maxBufferSize Maximum buffer size to process
   virtual void Reset(const double sampleRate, const int maxBufferSize);
 
+  /// \brief Reset the DSP unit, then prewarm
+  ///
+  /// Deprecated: ResetAndPrewarm() will be removed in v0.6.0. Reset() prewarms by default; use
+  /// SetPrewarmOnReset() to control whether Reset() calls prewarm().
+  /// \param sampleRate Current sample rate
+  /// \param maxBufferSize Maximum buffer size to process
+  void ResetAndPrewarm(const double sampleRate, const int maxBufferSize);
+
   /// \brief Control whether Reset() calls prewarm()
   /// \param prewarmOnReset true for Reset() to call prewarm(), false to skip prewarm()
   virtual void SetPrewarmOnReset(const bool prewarmOnReset);
@@ -189,6 +197,10 @@ public:
   /// \param outputLevel Output level in dBu
   void SetOutputLevel(const double outputLevel);
 
+  /// \brief Get the maximum buffer size
+  /// \return Maximum buffer size
+  int GetMaxBufferSize() const { return mMaxBufferSize; };
+
 protected:
   friend class wavenet::WaveNet; // Allow WaveNet to access protected members. Used in condition DSP.
 
@@ -207,10 +219,6 @@ protected:
   /// \brief Set the maximum buffer size
   /// \param maxBufferSize Maximum number of frames to process in a single call
   virtual void SetMaxBufferSize(const int maxBufferSize);
-
-  /// \brief Get the maximum buffer size
-  /// \return Maximum buffer size
-  int GetMaxBufferSize() const { return mMaxBufferSize; };
 
 private:
   const int mInChannels;

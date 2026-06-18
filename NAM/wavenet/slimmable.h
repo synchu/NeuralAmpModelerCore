@@ -3,10 +3,19 @@
 #include <memory>
 #include <vector>
 
-#if defined(_LIBCPP_VERSION) || defined(__clang__)
-// libc++ and clang-cl (MSVC STL): std::atomic<std::shared_ptr<T>> is not reliably
-// available. Use deprecated std::atomic_* free functions instead.
+// std::atomic<std::shared_ptr<T>> requires C++20 library support (libstdc++ >= GCC 12).
+// Where it is unavailable -- libc++ (any version so far) and older libstdc++ such as the
+// one shipped with GCC 9 -- fall back to the deprecated std::atomic_* free-function
+// overloads for shared_ptr, which provide the same acquire/release semantics. Keyed on the
+// C++20 feature-test macro rather than on a specific standard library so the right path is
+// chosen for every compiler.
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+  #define NAM_HAS_ATOMIC_SHARED_PTR 1
 #else
+  #define NAM_HAS_ATOMIC_SHARED_PTR 0
+#endif
+
+#if NAM_HAS_ATOMIC_SHARED_PTR
   #include <atomic>
 #endif
 
@@ -72,12 +81,17 @@ private:
     std::shared_ptr<DSP> model;
     std::vector<int> channels;
   };
+<<<<<<< HEAD
 #if defined(_LIBCPP_VERSION) || defined(__clang__)
   /// Staged model; synchronized via deprecated std::atomic_* overloads for shared_ptr.
   /// Used for libc++ and clang-cl (MSVC STL), where atomic<shared_ptr<T>> is not reliable.
-  std::shared_ptr<StagedSlimModel> _pending_staged;
-#else
+=======
+#if NAM_HAS_ATOMIC_SHARED_PTR
   std::atomic<std::shared_ptr<StagedSlimModel>> _pending_staged;
+#else
+  /// Staged model; synchronized via deprecated std::atomic_* overloads for shared_ptr only.
+>>>>>>> upstream/main
+  std::shared_ptr<StagedSlimModel> _pending_staged;
 #endif
 
   std::vector<int> _current_channels;
