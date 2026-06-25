@@ -7,6 +7,7 @@
 #include <functional>
 #include <stdexcept>
 #include "activations.h"
+#include "compiler.h"
 
 namespace nam
 {
@@ -71,13 +72,46 @@ public:
 
     const int num_samples = input.cols();
 
-    // Bulk copy top/bottom halves into contiguous buffers
-    input_buffer.leftCols(num_samples).noalias() = input.topRows(num_channels).leftCols(num_samples);
-    gating_buffer.leftCols(num_samples).noalias() = input.bottomRows(num_channels).leftCols(num_samples);
+#ifdef NAM_USE_INLINE_GEMM
+    // Optimized path: direct memory access with activation applied per-element
+    // Use outerStride() instead of rows() to correctly handle non-contiguous
+    // block expressions (e.g. topRows()) where outerStride > rows
+    const int input_stride = (int)input.outerStride();
+    const float* NAM_RESTRICT input_ptr = input.derived().data();
+    float* NAM_RESTRICT output_ptr = output.derived().data();
+    const int output_stride = (int)output.outerStride(); // Column stride for output
 
-    // Apply activations in bulk (one virtual call each, vectorizable)
-    input_activation->apply(input_buffer.data(), (long)num_channels * num_samples);
-    gating_activation->apply(gating_buffer.data(), (long)num_channels * num_samples);
+    for (int f = 0; f < num_samples; f++)
+    {
+      const float* NAM_RESTRICT in_col = input_ptr + f * input_stride;
+      float* NAM_RESTRICT out_col = output_ptr + f * output_stride;
+
+      // Copy input and gating channels to buffers, apply activations, multiply
+      for (int c = 0; c < num_channels; c++)
+      {
+        input_buffer(c, 0) = in_col[c];
+        gating_buffer(c, 0) = in_col[c + num_channels];
+      }
+
+      input_activation->apply(input_buffer);
+      gating_activation->apply(gating_buffer);
+
+      // Element-wise multiply and store
+      for (int c = 0; c < num_channels; c++)
+      {
+        out_col[c] = input_buffer(c, 0) * gating_buffer(c, 0);
+      }
+    }
+#else
+    // Original Eigen path
+    for (int i = 0; i < num_samples; i++)
+    {
+      // Copy to pre-allocated buffers and apply activations in-place
+      input_buffer = input.block(0, i, num_channels, 1);
+      input_activation->apply(input_buffer);
+
+      gating_buffer = input.block(num_channels, i, num_channels, 1);
+      gating_activation->apply(gating_buffer);
 
     // Element-wise multiply in bulk
     output.derived().leftCols(num_samples).noalias() =
@@ -150,29 +184,34 @@ public:
 
     const int num_samples = input.cols();
 
-    // Bulk copy top/bottom halves into contiguous buffers
-    pre_activation_buffer.leftCols(num_samples).noalias() = input.topRows(num_channels).leftCols(num_samples);
-    input_buffer.leftCols(num_samples).noalias() = input.topRows(num_channels).leftCols(num_samples);
-    blend_buffer.leftCols(num_samples).noalias() = input.bottomRows(num_channels).leftCols(num_samples);
+#ifdef NAM_USE_INLINE_GEMM
+    // Optimized path: direct memory access
+    // Use outerStride() instead of rows() to correctly handle non-contiguous
+    // block expressions (e.g. topRows()) where outerStride > rows
+    const int input_stride = (int)input.outerStride();
+    const float* NAM_RESTRICT input_ptr = input.derived().data();
+    float* NAM_RESTRICT output_ptr = output.derived().data();
+    const int output_stride = (int)output.outerStride(); // Column stride for output
 
-    // Apply activations in bulk (one virtual call each, vectorizable)
-    input_activation->apply(input_buffer.data(), (long)num_channels * num_samples);
-    blending_activation->apply(blend_buffer.data(), (long)num_channels * num_samples);
-
-    // Weighted blending in bulk: alpha * activated + (1 - alpha) * pre_activation
-    const long total = (long)num_channels * num_samples;
-    const float* __restrict__ pre_ptr = pre_activation_buffer.data();
-    const float* __restrict__ act_ptr = input_buffer.data();
-    const float* __restrict__ alpha_ptr = blend_buffer.data();
-    float* __restrict__ out_ptr = output.derived().data();
-    const int out_stride = (int)output.outerStride();
-    const int buf_stride = num_channels;
-
-    // Check if output is contiguous (outerStride == rows)
-    if (out_stride == buf_stride)
+    for (int f = 0; f < num_samples; f++)
     {
-      // Contiguous: flat loop over all elements
-      for (long i = 0; i < total; i++)
+      const float* NAM_RESTRICT in_col = input_ptr + f * input_stride;
+      float* NAM_RESTRICT out_col = output_ptr + f * output_stride;
+
+      // Copy channels to buffers
+      for (int c = 0; c < num_channels; c++)
+      {
+        pre_activation_buffer(c, 0) = in_col[c];
+        input_buffer(c, 0) = in_col[c];
+        blend_buffer(c, 0) = in_col[c + num_channels];
+      }
+
+      // Apply activations
+      input_activation->apply(input_buffer);
+      blending_activation->apply(blend_buffer);
+
+      // Weighted blending: alpha * activated + (1 - alpha) * pre_activation
+      for (int c = 0; c < num_channels; c++)
       {
         const float a = alpha_ptr[i];
         out_ptr[i] = a * act_ptr[i] + (1.0f - a) * pre_ptr[i];
