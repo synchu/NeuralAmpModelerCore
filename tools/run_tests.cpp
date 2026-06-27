@@ -28,6 +28,7 @@
 #include "test/test_input_buffer_verification.cpp"
 #include "test/test_linear.cpp"
 #include "test/test_lstm.cpp"
+#include "test/test_lstm_realtime_safe.cpp"
 #include "test/test_wavenet_configurable_gating.cpp"
 #include "test/test_noncontiguous_blocks.cpp"
 #include "test/test_extensible.cpp"
@@ -187,6 +188,7 @@ int main()
   test_wavenet::test_output_head::test_wavenet_with_two_layer_post_stack_head_applies_activation_per_layer_input();
   test_wavenet::test_layer_head_config::test_legacy_head_size_and_head_bias_implies_kernel_one();
   test_wavenet::test_layer_head_config::test_nested_head_with_kernel_size_three();
+  test_wavenet::test_layer_head_config::test_nested_head_with_dilation_three();
   test_wavenet::test_full::test_wavenet_multiple_arrays();
   test_wavenet::test_full::test_wavenet_zero_input();
   test_wavenet::test_full::test_wavenet_different_buffer_sizes();
@@ -243,6 +245,13 @@ int main()
   test_lstm::test_lstm_different_input_size();
   test_lstm::test_lstm_state_evolution();
   test_lstm::test_lstm_no_layers();
+
+  // LSTM real-time safety tests (issue #218)
+  test_lstm_realtime_safe::test_lstm_process_single_layer_realtime_safe();
+  test_lstm_realtime_safe::test_lstm_process_multi_layer_realtime_safe();
+  test_lstm_realtime_safe::test_lstm_process_multichannel_realtime_safe();
+  test_lstm_realtime_safe::test_lstm_process_large_hidden_realtime_safe();
+  test_lstm_realtime_safe::test_lstm_process_consecutive_calls_realtime_safe();
 
   // Gating activations tests
   test_gating_activations::TestGatingActivation::test_basic_functionality();
@@ -351,8 +360,12 @@ int main()
   test_a2_fast::test_detector_rejects_wrong_kernel_sizes();
   test_a2_fast::test_detector_rejects_wrong_activation();
   test_a2_fast::test_detector_rejects_gating();
+  test_a2_fast::test_detector_rejects_condition_dsp();
+  test_a2_fast::test_detector_rejects_legacy_gated();
   test_a2_fast::test_matches_generic_nano();
   test_a2_fast::test_matches_generic_standard();
+  test_a2_fast::test_prewarm_matches_generic_nano();
+  test_a2_fast::test_prewarm_matches_generic_standard();
   test_a2_fast::test_process_realtime_safe_nano();
   test_a2_fast::test_process_realtime_safe_standard();
 #endif
