@@ -467,10 +467,6 @@ public:
     // Matrix is organized as (channels, time_steps)
     unsigned long actual_channels = static_cast<unsigned long>(matrix.rows());
 
-    // Prepare the slopes for the current matrix size
-    std::vector<float> slopes_for_channels = negative_slopes;
-
-    // Fail loudly if input has more channels than activation
 #ifndef NDEBUG
     if (actual_channels != negative_slopes.size())
     {
